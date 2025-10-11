@@ -35,11 +35,12 @@ app.post('/create-payment-intent', async (req, res) => {
 
     console.log(`💰 Creating Live PaymentIntent for $${(amount / 100).toFixed(2)}`);
 
+    // ✅ FIX: specify payment method type
     const paymentIntent = await stripe.paymentIntents.create({
       amount,
       currency: 'usd',
+      payment_method_types: ['card'],
       receipt_email: customerEmail || undefined,
-      automatic_payment_methods: { enabled: true },
     });
 
     res.json({ clientSecret: paymentIntent.client_secret });
@@ -53,6 +54,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log(`🚀 Live Stripe Server running on http://localhost:${PORT}`)
 );
+
 
 
 
