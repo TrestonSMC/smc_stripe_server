@@ -2,7 +2,9 @@ require('dotenv').config({ path: './.env' });
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
+const { createClient } = require('@supabase/supabase-js');
 
+// ✅ Setup
 const stripeKey = process.env.STRIPE_SECRET_KEY;
 console.log('Loaded Stripe key:', stripeKey ? '✅ Found' : '❌ Missing');
 
@@ -12,9 +14,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ✅ Supabase client (for signed URLs)
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY // 👈 must be service role key, not anon
+);
+
 // 🏠 Root
 app.get('/', (req, res) => {
-  res.send('🚀 Stripe Live Server is running and ready for production!');
+  res.send('🚀 Stripe & Supabase Server is live and ready for production!');
 });
 
 // ✅ Test endpoint
@@ -32,40 +40,30 @@ app.post('/create-payment-intent', async (req, res) => {
   try {
     const { amount, customerEmail, customerId } = req.body;
 
-    if (!amount) {
-      return res.status(400).json({ error: 'Missing amount' });
-    }
+    if (!amount) return res.status(400).json({ error: 'Missing amount' });
 
     console.log(`💰 Creating Live PaymentIntent for $${(amount / 100).toFixed(2)}`);
 
-    // ✅ Create or reuse customer (for saved cards)
+    // ✅ Create or reuse customer
     let customer;
     if (customerId) {
       customer = customerId;
     } else if (customerEmail) {
-      // Try to find existing customer by email
-      const existingCustomers = await stripe.customers.list({
-        email: customerEmail,
-        limit: 1,
-      });
-      if (existingCustomers.data.length > 0) {
-        customer = existingCustomers.data[0].id;
-      } else {
-        const newCustomer = await stripe.customers.create({
-          email: customerEmail,
-          name: customerEmail.split('@')[0],
-        });
-        customer = newCustomer.id;
-      }
+      const existing = await stripe.customers.list({ email: customerEmail, limit: 1 });
+      customer = existing.data.length
+        ? existing.data[0].id
+        : (await stripe.customers.create({
+            email: customerEmail,
+            name: customerEmail.split('@')[0],
+          })).id;
     }
 
-    // ✅ Create PaymentIntent
     const paymentIntent = await stripe.paymentIntents.create({
       amount,
       currency: 'usd',
-      customer, // ✅ attaches PaymentIntent to customer
-      setup_future_usage: 'on_session', // ✅ shows “Save card for future payments”
-      automatic_payment_methods: { enabled: true }, // ✅ allows Apple Pay / Google Pay / Card
+      customer,
+      setup_future_usage: 'on_session',
+      automatic_payment_methods: { enabled: true },
       receipt_email: customerEmail || undefined,
     });
 
@@ -79,11 +77,38 @@ app.post('/create-payment-intent', async (req, res) => {
   }
 });
 
-// ✅ Server start
+// 🎥 Supabase Signed Upload Endpoint
+app.post('/get-upload-url', async (req, res) => {
+  try {
+    const { fileName } = req.body;
+    if (!fileName) return res.status(400).json({ error: 'Missing fileName' });
+
+    const filePath = `videos/${Date.now()}_${fileName}`;
+
+    // Generate signed upload URL valid for 1 hour
+    const { data, error } = await supabase.storage
+      .from('client_videos')
+      .createSignedUploadUrl(filePath, 60 * 60);
+
+    if (error) throw error;
+
+    res.json({
+      signedUrl: data.signedUrl,
+      path: filePath,
+      expiresIn: '1 hour',
+    });
+  } catch (err) {
+    console.error('❌ Error creating signed upload URL:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ✅ Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log(`🚀 Live Stripe Server running on http://localhost:${PORT}`)
+  console.log(`🚀 Server running on http://localhost:${PORT}`)
 );
+
 
 
 
