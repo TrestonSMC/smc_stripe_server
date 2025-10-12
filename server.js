@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
+const mime = require('mime-types');
 
 // ✅ Setup
 const stripeKey = process.env.STRIPE_SECRET_KEY;
@@ -14,10 +15,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ Supabase client (for signed URLs)
+// ✅ Supabase client (must use Service Role key)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY // 👈 must be service role key, not anon
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // 🏠 Root
@@ -39,12 +40,11 @@ app.get('/test', async (req, res) => {
 app.post('/create-payment-intent', async (req, res) => {
   try {
     const { amount, customerEmail, customerId } = req.body;
-
     if (!amount) return res.status(400).json({ error: 'Missing amount' });
 
     console.log(`💰 Creating Live PaymentIntent for $${(amount / 100).toFixed(2)}`);
 
-    // ✅ Create or reuse customer
+    // ✅ Create or reuse Stripe customer
     let customer;
     if (customerId) {
       customer = customerId;
@@ -83,18 +83,31 @@ app.post('/get-upload-url', async (req, res) => {
     const { fileName } = req.body;
     if (!fileName) return res.status(400).json({ error: 'Missing fileName' });
 
-    const filePath = `videos/${Date.now()}_${fileName}`;
+    // Validate file extension
+    const ext = fileName.split('.').pop().toLowerCase();
+    const allowed = ['mp4', 'mov', 'm4v', 'avi'];
+    if (!allowed.includes(ext)) {
+      return res.status(400).json({ error: `Unsupported file type: .${ext}` });
+    }
 
-    // Generate signed upload URL valid for 1 hour
+    const mimeType = mime.lookup(ext) || 'application/octet-stream';
+    const filePath = `videos/${Date.now()}_${fileName}`;
+    console.log(`🎬 Generating signed upload URL for ${filePath} (${mimeType})`);
+
+    // Generate signed upload URL valid for 1 hour (3600s)
     const { data, error } = await supabase.storage
       .from('client_videos')
-      .createSignedUploadUrl(filePath, 60 * 60);
+      .createSignedUploadUrl(filePath, 3600);
 
-    if (error) throw error;
+    if (error) {
+      console.error('❌ Supabase storage error:', error);
+      throw error;
+    }
 
     res.json({
       signedUrl: data.signedUrl,
       path: filePath,
+      mimeType,
       expiresIn: '1 hour',
     });
   } catch (err) {
@@ -105,13 +118,6 @@ app.post('/get-upload-url', async (req, res) => {
 
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`🚀 Server running on http://localhost:${PORT}`)
-);
-
-
-
-
-
-
-
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+});
