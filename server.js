@@ -1,88 +1,134 @@
 require('dotenv').config({ path: './.env' });
+
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const mime = require('mime-types');
 
-// ✅ Stripe setup
+// ===============================
+// 🔐 Stripe Setup
+// ===============================
 const stripeKey = process.env.STRIPE_SECRET_KEY;
-console.log('Loaded Stripe key:', stripeKey ? '✅ Found' : '❌ Missing');
+if (!stripeKey) {
+  throw new Error('❌ STRIPE_SECRET_KEY missing');
+}
 
-const stripe = new Stripe(stripeKey);
+const stripe = new Stripe(stripeKey, {
+  apiVersion: '2023-10-16',
+});
+
+// ===============================
+// 🚀 App Setup
+// ===============================
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
-// ✅ Supabase setup (must use service role key)
+// ===============================
+// 🧠 Supabase Setup (Service Role)
+// ===============================
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// ===============================
 // 🏠 Root
-app.get('/', (req, res) => {
-  res.send('🚀 Stripe & Supabase Server is live and ready for production!');
+// ===============================
+app.get('/', (_, res) => {
+  res.send('🚀 Stripe + Supabase backend is live');
 });
 
-// ✅ Test endpoint
-app.get('/test', async (req, res) => {
+// ===============================
+// 🧪 Stripe Test
+// ===============================
+app.get('/test', async (_, res) => {
   try {
     const balance = await stripe.balance.retrieve();
-    res.json({ message: '✅ Stripe API Live Mode Connected', balance });
+    res.json({ ok: true, balance });
   } catch (err) {
-    console.error('❌ Stripe test error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// 💳 Create PaymentIntent
+// ===============================
+// 💳 CREATE PAYMENT INTENT (FINAL)
+// ===============================
 app.post('/create-payment-intent', async (req, res) => {
   try {
     const { amount, customerEmail, customerId } = req.body;
-    if (!amount) return res.status(400).json({ error: 'Missing amount' });
 
-    console.log(`💰 Creating Live PaymentIntent for $${(amount / 100).toFixed(2)}`);
-
-    // ✅ Create or reuse customer
-    let customer;
-    if (customerId) {
-      customer = customerId;
-    } else if (customerEmail) {
-      const existing = await stripe.customers.list({ email: customerEmail, limit: 1 });
-      customer = existing.data.length
-        ? existing.data[0].id
-        : (await stripe.customers.create({
-            email: customerEmail,
-            name: customerEmail.split('@')[0],
-          })).id;
+    if (!amount || amount < 50) {
+      return res.status(400).json({ error: 'Invalid amount' });
     }
 
+    console.log(`💰 PaymentIntent: $${(amount / 100).toFixed(2)}`);
+
+    // -------------------------------
+    // 1️⃣ Find or Create Customer
+    // -------------------------------
+    let customer;
+
+    if (customerId) {
+      customer = await stripe.customers.retrieve(customerId);
+    } else if (customerEmail) {
+      const existing = await stripe.customers.list({
+        email: customerEmail,
+        limit: 1,
+      });
+
+      customer =
+        existing.data.length > 0
+          ? existing.data[0]
+          : await stripe.customers.create({
+              email: customerEmail,
+              name: customerEmail.split('@')[0],
+            });
+    } else {
+      return res.status(400).json({ error: 'Missing customer info' });
+    }
+
+    // -------------------------------
+    // 2️⃣ Create Ephemeral Key
+    // -------------------------------
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: customer.id },
+      { apiVersion: '2023-10-16' }
+    );
+
+    // -------------------------------
+    // 3️⃣ Create PaymentIntent
+    // -------------------------------
     const paymentIntent = await stripe.paymentIntents.create({
       amount,
       currency: 'usd',
-      customer,
-      setup_future_usage: 'on_session',
+      customer: customer.id,
       automatic_payment_methods: { enabled: true },
+      setup_future_usage: 'off_session',
       receipt_email: customerEmail || undefined,
     });
 
+    // -------------------------------
+    // 4️⃣ Send Secrets to App
+    // -------------------------------
     res.json({
       clientSecret: paymentIntent.client_secret,
-      customerId: customer,
+      customerId: customer.id,
+      ephemeralKey: ephemeralKey.secret,
     });
   } catch (error) {
-    console.error('❌ Error creating payment intent:', error);
+    console.error('❌ PaymentIntent error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// 🎥 Generate signed Supabase upload URL
+// ===============================
+// 🎥 SUPABASE SIGNED UPLOAD URL
+// ===============================
 app.post('/get-upload-url', async (req, res) => {
   try {
     const { fileName } = req.body;
-
     if (!fileName) {
       return res.status(400).json({ error: 'Missing fileName' });
     }
@@ -90,25 +136,18 @@ app.post('/get-upload-url', async (req, res) => {
     const ext = fileName.split('.').pop().toLowerCase();
     const allowed = ['mp4', 'mov', 'm4v', 'avi'];
     if (!allowed.includes(ext)) {
-      return res.status(400).json({ error: `Unsupported file type: .${ext}` });
+      return res.status(400).json({ error: `Unsupported type: ${ext}` });
     }
 
     const mimeType = mime.lookup(ext) || 'application/octet-stream';
     const filePath = `videos/${Date.now()}_${fileName}`;
 
-    console.log(`🎬 Request received to sign upload for: ${filePath} (${mimeType})`);
-
-    // 🧾 Generate signed upload URL (valid for 1 hour)
     const { data, error } = await supabase.storage
-      .from('client_videos') // ⚠️ must match your Supabase bucket name exactly
+      .from('client_videos')
       .createSignedUploadUrl(filePath, 60 * 60);
 
-    if (error) {
-      console.error('❌ Supabase storage error:', error);
-      throw error;
-    }
+    if (error) throw error;
 
-    console.log('✅ Signed upload URL successfully created');
     res.json({
       signedUrl: data.signedUrl,
       path: filePath,
@@ -116,14 +155,17 @@ app.post('/get-upload-url', async (req, res) => {
       expiresIn: '1 hour',
     });
   } catch (err) {
-    console.error('❌ Error creating signed upload URL:', err);
+    console.error('❌ Upload URL error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ✅ Start server
+// ===============================
+// ▶️ Start Server
+// ===============================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
+
 
