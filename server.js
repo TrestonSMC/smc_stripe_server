@@ -5,14 +5,13 @@ const cors = require('cors');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const mime = require('mime-types');
+const bodyParser = require('body-parser');
 
 // ===============================
 // 🔐 Stripe Setup
 // ===============================
 const stripeKey = process.env.STRIPE_SECRET_KEY;
-if (!stripeKey) {
-  throw new Error('❌ STRIPE_SECRET_KEY missing');
-}
+if (!stripeKey) throw new Error('❌ STRIPE_SECRET_KEY missing');
 
 const stripe = new Stripe(stripeKey, {
   apiVersion: '2023-10-16',
@@ -23,6 +22,10 @@ const stripe = new Stripe(stripeKey, {
 // ===============================
 const app = express();
 app.use(cors());
+
+// ⚠️ IMPORTANT:
+// Stripe webhook must use RAW body
+app.use('/webhooks/stripe', bodyParser.raw({ type: 'application/json' }));
 app.use(express.json());
 
 // ===============================
@@ -53,7 +56,7 @@ app.get('/test', async (_, res) => {
 });
 
 // ===============================
-// 💳 CREATE PAYMENT INTENT (FINAL)
+// 💳 CREATE PAYMENT INTENT
 // ===============================
 app.post('/create-payment-intent', async (req, res) => {
   try {
@@ -63,34 +66,32 @@ app.post('/create-payment-intent', async (req, res) => {
       return res.status(400).json({ error: 'Invalid amount' });
     }
 
+    if (!customerId) {
+      return res.status(400).json({ error: 'Missing Supabase user id' });
+    }
+
     console.log(`💰 PaymentIntent: $${(amount / 100).toFixed(2)}`);
 
     // -------------------------------
-    // 1️⃣ Find or Create Customer
+    // 1️⃣ Find or Create Stripe Customer
     // -------------------------------
     let customer;
 
-    if (customerId) {
-      customer = await stripe.customers.retrieve(customerId);
-    } else if (customerEmail) {
-      const existing = await stripe.customers.list({
-        email: customerEmail,
-        limit: 1,
-      });
+    const existing = await stripe.customers.list({
+      email: customerEmail,
+      limit: 1,
+    });
 
-      customer =
-        existing.data.length > 0
-          ? existing.data[0]
-          : await stripe.customers.create({
-              email: customerEmail,
-              name: customerEmail.split('@')[0],
-            });
-    } else {
-      return res.status(400).json({ error: 'Missing customer info' });
-    }
+    customer =
+      existing.data.length > 0
+        ? existing.data[0]
+        : await stripe.customers.create({
+            email: customerEmail,
+            name: customerEmail?.split('@')[0],
+          });
 
     // -------------------------------
-    // 2️⃣ Create Ephemeral Key
+    // 2️⃣ Ephemeral Key (Mobile)
     // -------------------------------
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
@@ -107,11 +108,11 @@ app.post('/create-payment-intent', async (req, res) => {
       automatic_payment_methods: { enabled: true },
       setup_future_usage: 'off_session',
       receipt_email: customerEmail || undefined,
+      metadata: {
+        user_id: customerId, // 👈 Supabase auth.users.id
+      },
     });
 
-    // -------------------------------
-    // 4️⃣ Send Secrets to App
-    // -------------------------------
     res.json({
       clientSecret: paymentIntent.client_secret,
       customerId: customer.id,
@@ -121,6 +122,51 @@ app.post('/create-payment-intent', async (req, res) => {
     console.error('❌ PaymentIntent error:', error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// ===============================
+// 🔔 STRIPE WEBHOOK (POINTS AWARD)
+// ===============================
+app.post('/webhooks/stripe', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('❌ Webhook signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // ✅ PAYMENT SUCCEEDED
+  if (event.type === 'payment_intent.succeeded') {
+    const intent = event.data.object;
+
+    const userId = intent.metadata?.user_id;
+    const amountCents = intent.amount_received;
+
+    if (!userId) {
+      console.warn('⚠️ PaymentIntent missing user_id metadata');
+      return res.json({ received: true });
+    }
+
+    const points = Math.floor(amountCents / 1000); // $10 = 1 point
+
+    if (points > 0) {
+      console.log(`⭐ Awarding ${points} pts to user ${userId}`);
+
+      await supabase.rpc('award_points_for_payment', {
+        p_user_id: userId,
+        p_amount_cents: amountCents,
+      });
+    }
+  }
+
+  res.json({ received: true });
 });
 
 // ===============================
@@ -167,5 +213,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
 
 
