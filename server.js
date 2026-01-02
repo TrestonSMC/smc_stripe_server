@@ -55,7 +55,7 @@ app.get('/test', async (_, res) => {
 });
 
 // ===============================
-// 💳 CREATE PAYMENT INTENT (Rewards Only)
+// 💳 CREATE PAYMENT INTENT (REWARDS ONLY)
 // ===============================
 app.post('/create-payment-intent', async (req, res) => {
   try {
@@ -69,13 +69,7 @@ app.post('/create-payment-intent', async (req, res) => {
       return res.status(400).json({ error: 'Missing Supabase user id' });
     }
 
-    console.log(`💰 PaymentIntent: $${(amount / 100).toFixed(2)}`);
-
-    // -------------------------------
-    // 1️⃣ Find or Create Stripe Customer
-    // -------------------------------
     let customer;
-
     const existing = await stripe.customers.list({
       email: customerEmail,
       limit: 1,
@@ -89,27 +83,18 @@ app.post('/create-payment-intent', async (req, res) => {
             name: customerEmail?.split('@')[0],
           });
 
-    // -------------------------------
-    // 2️⃣ Ephemeral Key (Mobile)
-    // -------------------------------
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
       { apiVersion: '2023-10-16' }
     );
 
-    // -------------------------------
-    // 3️⃣ Create PaymentIntent
-    // -------------------------------
     const paymentIntent = await stripe.paymentIntents.create({
       amount,
       currency: 'usd',
       customer: customer.id,
       automatic_payment_methods: { enabled: true },
-      setup_future_usage: 'off_session',
       receipt_email: customerEmail || undefined,
-      metadata: {
-        user_id: customerId, // Supabase auth.users.id
-      },
+      metadata: { user_id: customerId },
     });
 
     res.json({
@@ -117,9 +102,45 @@ app.post('/create-payment-intent', async (req, res) => {
       customerId: customer.id,
       ephemeralKey: ephemeralKey.secret,
     });
-  } catch (error) {
-    console.error('❌ PaymentIntent error:', error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===============================
+// 💳 INVOICE PAYMENT SHEET (PAY NOW)
+// ===============================
+app.post('/invoice-payment-sheet', async (req, res) => {
+  try {
+    const { invoiceId } = req.body;
+
+    if (!invoiceId) {
+      return res.status(400).json({ error: 'Missing invoiceId' });
+    }
+
+    const invoice = await stripe.invoices.retrieve(invoiceId);
+
+    if (!invoice.payment_intent) {
+      return res.status(400).json({ error: 'Invoice not payable yet' });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.retrieve(
+      invoice.payment_intent
+    );
+
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: invoice.customer },
+      { apiVersion: '2023-10-16' }
+    );
+
+    res.json({
+      clientSecret: paymentIntent.client_secret,
+      customerId: invoice.customer,
+      ephemeralKey: ephemeralKey.secret,
+    });
+  } catch (err) {
+    console.error('❌ Invoice payment sheet error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -128,8 +149,8 @@ app.post('/create-payment-intent', async (req, res) => {
 // ===============================
 app.post('/webhooks/stripe', async (req, res) => {
   const sig = req.headers['stripe-signature'];
-
   let event;
+
   try {
     event = stripe.webhooks.constructEvent(
       req.body,
@@ -137,18 +158,11 @@ app.post('/webhooks/stripe', async (req, res) => {
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
-    console.error('❌ Webhook signature failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // ===============================
-  // 🧾 INVOICE FINALIZED (PAYABLE)
-  // ===============================
   if (event.type === 'invoice.finalized') {
     const invoice = event.data.object;
-
-    console.log(`🧾 Invoice finalized: ${invoice.id}`);
-
     await supabase.from('invoices').upsert({
       stripe_invoice_id: invoice.id,
       stripe_customer_id: invoice.customer,
@@ -159,14 +173,8 @@ app.post('/webhooks/stripe', async (req, res) => {
     });
   }
 
-  // ===============================
-  // ✅ INVOICE PAID
-  // ===============================
   if (event.type === 'invoice.payment_succeeded') {
     const invoice = event.data.object;
-
-    console.log(`✅ Invoice paid: ${invoice.id}`);
-
     await supabase
       .from('invoices')
       .update({
@@ -176,84 +184,26 @@ app.post('/webhooks/stripe', async (req, res) => {
       .eq('stripe_invoice_id', invoice.id);
   }
 
-  // ===============================
-  // ❌ INVOICE FAILED
-  // ===============================
   if (event.type === 'invoice.payment_failed') {
     const invoice = event.data.object;
-
-    console.warn(`❌ Invoice payment failed: ${invoice.id}`);
-
     await supabase
       .from('invoices')
       .update({ status: 'failed' })
       .eq('stripe_invoice_id', invoice.id);
   }
 
-  // ===============================
-  // ⭐ PAYMENT SUCCEEDED (REWARDS)
-  // ===============================
   if (event.type === 'payment_intent.succeeded') {
     const intent = event.data.object;
-
     const userId = intent.metadata?.user_id;
-    const amountCents = intent.amount_received;
-
-    if (!userId) {
-      console.warn('⚠️ PaymentIntent missing user_id metadata');
-      return res.json({ received: true });
-    }
-
-    const points = Math.floor(amountCents / 1000); // $10 = 1 point
-
-    if (points > 0) {
-      console.log(`⭐ Awarding ${points} pts to user ${userId}`);
-
+    if (userId) {
       await supabase.rpc('award_points_for_payment', {
         p_user_id: userId,
-        p_amount_cents: amountCents,
+        p_amount_cents: intent.amount_received,
       });
     }
   }
 
   res.json({ received: true });
-});
-
-// ===============================
-// 🎥 SUPABASE SIGNED UPLOAD URL
-// ===============================
-app.post('/get-upload-url', async (req, res) => {
-  try {
-    const { fileName } = req.body;
-    if (!fileName) {
-      return res.status(400).json({ error: 'Missing fileName' });
-    }
-
-    const ext = fileName.split('.').pop().toLowerCase();
-    const allowed = ['mp4', 'mov', 'm4v', 'avi'];
-    if (!allowed.includes(ext)) {
-      return res.status(400).json({ error: `Unsupported type: ${ext}` });
-    }
-
-    const mimeType = mime.lookup(ext) || 'application/octet-stream';
-    const filePath = `videos/${Date.now()}_${fileName}`;
-
-    const { data, error } = await supabase.storage
-      .from('client_videos')
-      .createSignedUploadUrl(filePath, 60 * 60);
-
-    if (error) throw error;
-
-    res.json({
-      signedUrl: data.signedUrl,
-      path: filePath,
-      mimeType,
-      expiresIn: '1 hour',
-    });
-  } catch (err) {
-    console.error('❌ Upload URL error:', err);
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // ===============================
