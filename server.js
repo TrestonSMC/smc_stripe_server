@@ -23,8 +23,7 @@ const stripe = new Stripe(stripeKey, {
 const app = express();
 app.use(cors());
 
-// ⚠️ IMPORTANT:
-// Stripe webhook must use RAW body
+// ⚠️ Stripe webhook must use RAW body
 app.use('/webhooks/stripe', bodyParser.raw({ type: 'application/json' }));
 app.use(express.json());
 
@@ -56,7 +55,7 @@ app.get('/test', async (_, res) => {
 });
 
 // ===============================
-// 💳 CREATE PAYMENT INTENT
+// 💳 CREATE PAYMENT INTENT (Rewards Only)
 // ===============================
 app.post('/create-payment-intent', async (req, res) => {
   try {
@@ -109,7 +108,7 @@ app.post('/create-payment-intent', async (req, res) => {
       setup_future_usage: 'off_session',
       receipt_email: customerEmail || undefined,
       metadata: {
-        user_id: customerId, // 👈 Supabase auth.users.id
+        user_id: customerId, // Supabase auth.users.id
       },
     });
 
@@ -125,7 +124,7 @@ app.post('/create-payment-intent', async (req, res) => {
 });
 
 // ===============================
-// 🔔 STRIPE WEBHOOK (POINTS AWARD)
+// 🔔 STRIPE WEBHOOK
 // ===============================
 app.post('/webhooks/stripe', async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -142,7 +141,58 @@ app.post('/webhooks/stripe', async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // ✅ PAYMENT SUCCEEDED
+  // ===============================
+  // 🧾 INVOICE FINALIZED (PAYABLE)
+  // ===============================
+  if (event.type === 'invoice.finalized') {
+    const invoice = event.data.object;
+
+    console.log(`🧾 Invoice finalized: ${invoice.id}`);
+
+    await supabase.from('invoices').upsert({
+      stripe_invoice_id: invoice.id,
+      stripe_customer_id: invoice.customer,
+      amount_due: invoice.amount_due / 100,
+      status: 'open',
+      hosted_invoice_url: invoice.hosted_invoice_url,
+      created_at: new Date(invoice.created * 1000),
+    });
+  }
+
+  // ===============================
+  // ✅ INVOICE PAID
+  // ===============================
+  if (event.type === 'invoice.payment_succeeded') {
+    const invoice = event.data.object;
+
+    console.log(`✅ Invoice paid: ${invoice.id}`);
+
+    await supabase
+      .from('invoices')
+      .update({
+        status: 'paid',
+        paid_at: new Date(invoice.status_transitions.paid_at * 1000),
+      })
+      .eq('stripe_invoice_id', invoice.id);
+  }
+
+  // ===============================
+  // ❌ INVOICE FAILED
+  // ===============================
+  if (event.type === 'invoice.payment_failed') {
+    const invoice = event.data.object;
+
+    console.warn(`❌ Invoice payment failed: ${invoice.id}`);
+
+    await supabase
+      .from('invoices')
+      .update({ status: 'failed' })
+      .eq('stripe_invoice_id', invoice.id);
+  }
+
+  // ===============================
+  // ⭐ PAYMENT SUCCEEDED (REWARDS)
+  // ===============================
   if (event.type === 'payment_intent.succeeded') {
     const intent = event.data.object;
 
@@ -213,6 +263,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
 
 
 
