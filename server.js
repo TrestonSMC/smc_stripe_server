@@ -12,19 +12,7 @@ const bodyParser = require('body-parser');
 const stripeKey = process.env.STRIPE_SECRET_KEY;
 if (!stripeKey) throw new Error('❌ STRIPE_SECRET_KEY missing');
 
-const stripe = new Stripe(stripeKey, {
-  apiVersion: '2023-10-16',
-});
-
-// ===============================
-// 🚀 App Setup
-// ===============================
-const app = express();
-app.use(cors());
-
-// ⚠️ Stripe webhook must use RAW body
-app.use('/webhooks/stripe', bodyParser.raw({ type: 'application/json' }));
-app.use(express.json());
+const stripe = new Stripe(stripeKey, { apiVersion: '2023-10-16' });
 
 // ===============================
 // 🧠 Supabase Setup (Service Role)
@@ -35,11 +23,19 @@ const supabase = createClient(
 );
 
 // ===============================
+// 🚀 App Setup
+// ===============================
+const app = express();
+app.use(cors());
+
+// Stripe webhook must use RAW body
+app.use('/webhooks/stripe', bodyParser.raw({ type: 'application/json' }));
+app.use(express.json());
+
+// ===============================
 // 🏠 Root
 // ===============================
-app.get('/', (_, res) => {
-  res.send('🚀 Stripe + Supabase backend is live');
-});
+app.get('/', (_, res) => res.send('🚀 Stripe + Supabase backend is live'));
 
 // ===============================
 // 🧪 Stripe Test
@@ -53,113 +49,102 @@ app.get('/test', async (_, res) => {
   }
 });
 
-// =====================================================
-// 🧾 CREATE STRIPE INVOICE (OPTION B — REQUIRED)
-// =====================================================
-app.post('/create-stripe-invoice', async (req, res) => {
+// ===============================
+// 🔎 Helper: Find/Create Stripe Customer
+// ===============================
+async function getOrCreateCustomerByEmail(customerEmail) {
+  const existing = await stripe.customers.list({ email: customerEmail, limit: 1 });
+  if (existing.data.length > 0) return existing.data[0];
+
+  return stripe.customers.create({
+    email: customerEmail,
+    name: customerEmail?.split('@')[0],
+  });
+}
+
+// ===============================
+// 💳 Create PaymentIntent for an INVOICE (Supabase invoice is source of truth)
+// ===============================
+app.post('/create-payment-intent', async (req, res) => {
   try {
-    const {
-      customerId,        // Supabase user id
-      customerEmail,
-      amountCents,
-      description,
-    } = req.body;
+    const { customerId, customerEmail, invoiceId } = req.body;
 
-    if (!customerId || !amountCents) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!customerId) return res.status(400).json({ error: 'Missing customerId' });
+    if (!customerEmail) return res.status(400).json({ error: 'Missing customerEmail' });
+    if (!invoiceId) return res.status(400).json({ error: 'Missing invoiceId' });
+
+    // Pull invoice from Supabase (authoritative)
+    const { data: invoice, error: invErr } = await supabase
+      .from('invoices')
+      .select('id, customer_id, amount, status')
+      .eq('id', invoiceId)
+      .maybeSingle();
+
+    if (invErr) throw invErr;
+    if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
+    if (invoice.customer_id !== customerId) {
+      return res.status(403).json({ error: 'Invoice does not belong to this user' });
+    }
+    if (invoice.status === 'paid') {
+      return res.status(409).json({ error: 'Invoice already paid' });
     }
 
-    // 1️⃣ Find or create Stripe customer
-    const existing = await stripe.customers.list({
-      email: customerEmail,
-      limit: 1,
-    });
-
-    const customer =
-      existing.data.length > 0
-        ? existing.data[0]
-        : await stripe.customers.create({
-            email: customerEmail,
-            metadata: { supabase_user_id: customerId },
-          });
-
-    // 2️⃣ Create invoice (ACH requires auto-charge)
-    const invoice = await stripe.invoices.create({
-      customer: customer.id,
-      collection_method: 'charge_automatically',
-      auto_advance: true, // finalize automatically
-      metadata: {
-        supabase_user_id: customerId,
-      },
-    });
-
-    // 3️⃣ Attach invoice item
-    await stripe.invoiceItems.create({
-      customer: customer.id,
-      invoice: invoice.id,
-      amount: amountCents,
-      currency: 'usd',
-      description: description || 'SMC Services',
-    });
-
-    res.json({
-      ok: true,
-      stripeInvoiceId: invoice.id,
-    });
-  } catch (err) {
-    console.error('❌ Create invoice error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// =====================================================
-// 💳 INVOICE PAYMENT SHEET (CARD + ACH)
-// =====================================================
-app.post('/invoice-payment-sheet', async (req, res) => {
-  try {
-    const { invoiceId } = req.body;
-    if (!invoiceId) {
-      return res.status(400).json({ error: 'Missing invoiceId' });
+    const amountCents = Math.round(Number(invoice.amount) * 100);
+    if (!amountCents || amountCents < 50) {
+      return res.status(400).json({ error: 'Invalid invoice amount' });
     }
 
-    const invoice = await stripe.invoices.retrieve(invoiceId);
+    const customer = await getOrCreateCustomerByEmail(customerEmail);
 
-    if (!invoice.payment_intent) {
-      return res.status(400).json({ error: 'Invoice not payable yet' });
-    }
-
-    // Ensure ACH allowed
-    const paymentIntent = await stripe.paymentIntents.update(
-      invoice.payment_intent,
-      {
-        payment_method_types: ['card', 'us_bank_account'],
-        setup_future_usage: 'off_session',
-        automatic_payment_methods: {
-          enabled: true,
-          allow_redirects: 'always',
-        },
-      }
-    );
-
+    // Ephemeral key for PaymentSheet
     const ephemeralKey = await stripe.ephemeralKeys.create(
-      { customer: invoice.customer },
+      { customer: customer.id },
       { apiVersion: '2023-10-16' }
     );
 
+    // PaymentIntent supports Card + ACH (us_bank_account)
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountCents,
+      currency: 'usd',
+      customer: customer.id,
+
+      // ACH + Card
+      payment_method_types: ['card', 'us_bank_account'],
+
+      automatic_payment_methods: {
+        enabled: true,
+        allow_redirects: 'always',
+      },
+
+      receipt_email: customerEmail,
+
+      metadata: {
+        user_id: customerId,
+        invoice_id: invoiceId,
+      },
+    });
+
+    // Save PI id on invoice (helps debugging + webhook backup)
+    await supabase
+      .from('invoices')
+      .update({ payment_intent_id: paymentIntent.id })
+      .eq('id', invoiceId);
+
     res.json({
       clientSecret: paymentIntent.client_secret,
-      customerId: invoice.customer,
+      paymentIntentId: paymentIntent.id,
+      customerId: customer.id,
       ephemeralKey: ephemeralKey.secret,
     });
   } catch (err) {
-    console.error('❌ Invoice payment sheet error:', err);
+    console.error('❌ create-payment-intent error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// =====================================================
-// 🔔 STRIPE WEBHOOK (SOURCE OF TRUTH)
-// =====================================================
+// ===============================
+// 🔔 STRIPE WEBHOOK (backup safety net)
+// ===============================
 app.post('/webhooks/stripe', async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -175,72 +160,60 @@ app.post('/webhooks/stripe', async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // -------------------------------
-  // Invoice finalized → insert Supabase
-  // -------------------------------
-  if (event.type === 'invoice.finalized') {
-    const invoice = event.data.object;
-    const userId = invoice.metadata?.supabase_user_id;
+  try {
+    // ✅ Success (card or ACH when Stripe marks it succeeded)
+    if (event.type === 'payment_intent.succeeded') {
+      const intent = event.data.object;
+      const invoiceId = intent.metadata?.invoice_id;
 
-    await supabase.from('invoices').insert({
-      customer_id: userId,
-      stripe_invoice_id: invoice.id,
-      stripe_customer_id: invoice.customer,
-      amount: invoice.amount_due / 100,
-      status: 'unpaid',
-      created_at: new Date(invoice.created * 1000),
-    });
-  }
+      if (invoiceId) {
+        // mark paid (if not already)
+        await supabase
+          .from('invoices')
+          .update({
+            status: 'paid',
+            paid_at: new Date().toISOString(),
+            payment_method: intent.payment_method_types?.[0] ?? null,
+            payment_intent_id: intent.id,
+          })
+          .eq('id', invoiceId);
 
-  // -------------------------------
-  // Invoice paid
-  // -------------------------------
-  if (event.type === 'invoice.payment_succeeded') {
-    const invoice = event.data.object;
-
-    await supabase
-      .from('invoices')
-      .update({ status: 'paid' })
-      .eq('stripe_invoice_id', invoice.id);
-  }
-
-  // -------------------------------
-  // Invoice failed
-  // -------------------------------
-  if (event.type === 'invoice.payment_failed') {
-    const invoice = event.data.object;
-
-    await supabase
-      .from('invoices')
-      .update({ status: 'failed' })
-      .eq('stripe_invoice_id', invoice.id);
-  }
-
-  // -------------------------------
-  // Rewards (Card only — ACH later)
-  // -------------------------------
-  if (event.type === 'payment_intent.succeeded') {
-    const intent = event.data.object;
-    const userId = intent.metadata?.user_id;
-
-    if (userId) {
-      await supabase.rpc('award_points_for_payment', {
-        p_user_id: userId,
-        p_amount_cents: intent.amount_received,
-      });
+        // award points if not already
+        await supabase.rpc('award_points_for_invoice', { p_invoice_id: invoiceId });
+      }
     }
-  }
 
-  res.json({ received: true });
+    // ❌ Failure (ACH can fail later) — rollback points
+    if (event.type === 'payment_intent.payment_failed') {
+      const intent = event.data.object;
+      const invoiceId = intent.metadata?.invoice_id;
+
+      if (invoiceId) {
+        await supabase
+          .from('invoices')
+          .update({
+            status: 'unpaid',
+            payment_method: intent.payment_method_types?.[0] ?? null,
+            payment_intent_id: intent.id,
+          })
+          .eq('id', invoiceId);
+
+        await supabase.rpc('reverse_points_for_invoice', { p_invoice_id: invoiceId });
+      }
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('❌ Webhook handler error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ===============================
 // ▶️ Start Server
 // ===============================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 
 
