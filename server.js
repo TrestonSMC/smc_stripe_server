@@ -41,9 +41,9 @@ app.get('/', (_, res) => res.send('🚀 Stripe backend live'));
 // ============================================================
 app.post('/create-payment-intent', async (req, res) => {
   try {
-    const { amount, customerEmail, customerId, invoiceId } = req.body;
+    const { amount, customerEmail, customerId, transactionId } = req.body;
 
-    if (!amount || !customerId) {
+    if (!amount || !customerId || !transactionId) {
       return res.status(400).json({ error: 'Invalid request' });
     }
 
@@ -65,17 +65,25 @@ app.post('/create-payment-intent', async (req, res) => {
       { apiVersion: '2023-10-16' }
     );
 
-    // 3️⃣ PaymentIntent (ACH + card)
+    // 3️⃣ PaymentIntent
     const intent = await stripe.paymentIntents.create({
       amount,
       currency: 'usd',
       customer: customer.id,
       automatic_payment_methods: { enabled: true },
       metadata: {
+        transaction_id: transactionId,
         user_id: customerId,
-        invoice_id: invoiceId || '',
       },
     });
+
+    // 🔗 Save intent → transaction
+    await supabase
+      .from('transactions')
+      .update({
+        payment_intent_id: intent.id,
+      })
+      .eq('id', transactionId);
 
     res.json({
       clientSecret: intent.client_secret,
@@ -113,37 +121,16 @@ app.post('/webhooks/stripe', async (req, res) => {
     // ====================================================
     if (event.type === 'payment_intent.succeeded') {
       const intent = event.data.object;
+      const transactionId = intent.metadata.transaction_id;
 
-      // Mark transaction succeeded
-      const { data: txn } = await supabase
+      if (!transactionId) return res.json({ received: true });
+
+      await supabase
         .from('transactions')
-        .update({ status: 'succeeded' })
-        .eq('payment_intent_id', intent.id)
-        .select()
-        .single();
-
-      if (txn) {
-        // Apply points
-        await supabase
-          .from('profiles')
-          .update({
-            points: supabase.rpc('increment', {
-              x: txn.points,
-            }),
-          })
-          .eq('id', txn.user_id);
-
-        // Mark invoice paid if linked
-        if (txn.invoice_id) {
-          await supabase
-            .from('invoices')
-            .update({
-              status: 'paid',
-              paid_at: new Date(),
-            })
-            .eq('id', txn.invoice_id);
-        }
-      }
+        .update({
+          status: 'succeeded',
+        })
+        .eq('id', transactionId);
     }
 
     // ====================================================
@@ -154,11 +141,16 @@ app.post('/webhooks/stripe', async (req, res) => {
       event.type === 'payment_intent.canceled'
     ) {
       const intent = event.data.object;
+      const transactionId = intent.metadata.transaction_id;
+
+      if (!transactionId) return res.json({ received: true });
 
       await supabase
         .from('transactions')
-        .update({ status: 'failed' })
-        .eq('payment_intent_id', intent.id);
+        .update({
+          status: 'failed',
+        })
+        .eq('id', transactionId);
     }
 
     res.json({ received: true });
@@ -175,4 +167,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log(`🚀 Stripe server running on port ${PORT}`)
 );
+
 
