@@ -9,10 +9,9 @@ const bodyParser = require('body-parser');
 // ===============================
 // 🔐 Stripe Setup
 // ===============================
-const stripeKey = process.env.STRIPE_SECRET_KEY;
-if (!stripeKey) throw new Error('❌ STRIPE_SECRET_KEY missing');
-
-const stripe = new Stripe(stripeKey, { apiVersion: '2023-10-16' });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2023-10-16',
+});
 
 // ===============================
 // 🚀 App Setup
@@ -25,7 +24,7 @@ app.use('/webhooks/stripe', bodyParser.raw({ type: 'application/json' }));
 app.use(express.json());
 
 // ===============================
-// 🧠 Supabase Setup (Service Role)
+// 🧠 Supabase (Service Role)
 // ===============================
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -35,73 +34,43 @@ const supabase = createClient(
 // ===============================
 // 🏠 Root
 // ===============================
-app.get('/', (_, res) => res.send('🚀 Stripe + Supabase backend is live'));
-
-// ===============================
-// 🧪 Stripe Test
-// ===============================
-app.get('/test', async (_, res) => {
-  try {
-    const balance = await stripe.balance.retrieve();
-    res.json({ ok: true, balance });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+app.get('/', (_, res) => res.send('🚀 Stripe backend live'));
 
 // ============================================================
-// 💳 CREATE PAYMENT INTENT (FOR PAYMENT SHEET - CARD + ACH)
-// ✅ This is what your Flutter PaymentScreen calls.
+// 💳 CREATE PAYMENT INTENT (CARD + ACH)
 // ============================================================
 app.post('/create-payment-intent', async (req, res) => {
   try {
     const { amount, customerEmail, customerId, invoiceId } = req.body;
 
-    if (!amount || amount < 50) {
-      return res.status(400).json({ error: 'Invalid amount' });
-    }
-    if (!customerId) {
-      return res.status(400).json({ error: 'Missing Supabase user id' });
+    if (!amount || !customerId) {
+      return res.status(400).json({ error: 'Invalid request' });
     }
 
-    // 1) Find or create Stripe customer
-    let customer;
+    // 1️⃣ Stripe customer
     const existing = await stripe.customers.list({
       email: customerEmail,
       limit: 1,
     });
 
-    customer =
-      existing.data.length > 0
-        ? existing.data[0]
-        : await stripe.customers.create({
-            email: customerEmail,
-            name: customerEmail?.split('@')[0] || 'Customer',
-          });
+    const customer =
+      existing.data[0] ||
+      (await stripe.customers.create({
+        email: customerEmail,
+      }));
 
-    // 2) Ephemeral key (PaymentSheet)
+    // 2️⃣ Ephemeral key
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
       { apiVersion: '2023-10-16' }
     );
 
-    // 3) PaymentIntent supports ACH + card
-    const paymentIntent = await stripe.paymentIntents.create({
+    // 3️⃣ PaymentIntent (ACH + card)
+    const intent = await stripe.paymentIntents.create({
       amount,
       currency: 'usd',
       customer: customer.id,
-
-      // Card + ACH
-      payment_method_types: ['card', 'us_bank_account'],
-
-      // Helps PaymentSheet show bank options
-      automatic_payment_methods: {
-        enabled: true,
-        allow_redirects: 'always',
-      },
-
-      receipt_email: customerEmail || undefined,
-
+      automatic_payment_methods: { enabled: true },
       metadata: {
         user_id: customerId,
         invoice_id: invoiceId || '',
@@ -109,148 +78,19 @@ app.post('/create-payment-intent', async (req, res) => {
     });
 
     res.json({
-      clientSecret: paymentIntent.client_secret,
+      clientSecret: intent.client_secret,
+      paymentIntentId: intent.id,
       customerId: customer.id,
       ephemeralKey: ephemeralKey.secret,
     });
   } catch (err) {
-    console.error('❌ create-payment-intent error:', err);
+    console.error('❌ create-payment-intent:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ============================================================
-// 🧾 CREATE STRIPE INVOICE (FROM ADMIN DASHBOARD)
-// ✅ Admin flow: create invoice in Supabase -> call this with invoiceId
-// ============================================================
-app.post('/create-stripe-invoice', async (req, res) => {
-  try {
-    const { invoiceId } = req.body;
-    if (!invoiceId) return res.status(400).json({ error: 'Missing invoiceId' });
-
-    // 1) Fetch invoice + items + client email
-    const { data: invoice, error } = await supabase
-      .from('invoices')
-      .select(
-        `
-        id,
-        customer_id,
-        amount,
-        invoice_items (
-          description,
-          quantity,
-          unit_price
-        ),
-        profiles!invoices_customer_id_fkey (
-          email
-        )
-      `
-      )
-      .eq('id', invoiceId)
-      .single();
-
-    if (error || !invoice) throw new Error('Invoice not found');
-    if (!invoice.profiles?.email) throw new Error('Client email missing');
-
-    // 2) Find/create Stripe customer
-    const email = invoice.profiles.email;
-    const existing = await stripe.customers.list({ email, limit: 1 });
-    const customer =
-      existing.data.length > 0
-        ? existing.data[0]
-        : await stripe.customers.create({ email });
-
-    // 3) Create Stripe invoice
-    // NOTE: If you want PaymentSheet on invoice objects, Stripe invoices are not the smoothest path.
-    // You can still use this to email invoices + hosted page.
-    const stripeInvoice = await stripe.invoices.create({
-      customer: customer.id,
-      collection_method: 'send_invoice',
-      days_until_due: 30,
-      metadata: {
-        supabase_invoice_id: invoice.id,
-        user_id: invoice.customer_id,
-      },
-    });
-
-    // 4) Add line items
-    for (const item of invoice.invoice_items || []) {
-      await stripe.invoiceItems.create({
-        customer: customer.id,
-        invoice: stripeInvoice.id,
-        description: item.description || '',
-        quantity: Math.round((item.quantity || 1) * 1),
-        unit_amount: Math.round((item.unit_price || 0) * 100),
-        currency: 'usd',
-      });
-    }
-
-    // 5) Finalize
-    await stripe.invoices.finalizeInvoice(stripeInvoice.id);
-
-    // 6) Save Stripe IDs back to Supabase
-    await supabase
-      .from('invoices')
-      .update({
-        stripe_invoice_id: stripeInvoice.id,
-        stripe_customer_id: customer.id,
-        status: 'open', // keep your app consistent
-      })
-      .eq('id', invoice.id);
-
-    res.json({ success: true, stripeInvoiceId: stripeInvoice.id });
-  } catch (err) {
-    console.error('❌ Stripe invoice create error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// 💳 PAYMENT SHEET FOR STRIPE INVOICE (ACH + CARD)
-// ✅ Only works if invoice has a payment_intent.
-// ============================================================
-app.post('/invoice-payment-sheet', async (req, res) => {
-  try {
-    const { stripeInvoiceId } = req.body;
-    if (!stripeInvoiceId) {
-      return res.status(400).json({ error: 'Missing stripeInvoiceId' });
-    }
-
-    const invoice = await stripe.invoices.retrieve(stripeInvoiceId);
-    if (!invoice.payment_intent) {
-      throw new Error('Invoice not payable yet');
-    }
-
-    const paymentIntent = await stripe.paymentIntents.update(
-      invoice.payment_intent,
-      {
-        payment_method_types: ['card', 'us_bank_account'],
-        automatic_payment_methods: {
-          enabled: true,
-          allow_redirects: 'always',
-        },
-        metadata: invoice.metadata || {},
-      }
-    );
-
-    const ephemeralKey = await stripe.ephemeralKeys.create(
-      { customer: invoice.customer },
-      { apiVersion: '2023-10-16' }
-    );
-
-    res.json({
-      clientSecret: paymentIntent.client_secret,
-      customerId: invoice.customer,
-      ephemeralKey: ephemeralKey.secret,
-    });
-  } catch (err) {
-    console.error('❌ Invoice payment sheet error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// 🔔 STRIPE WEBHOOK
+// 🔔 STRIPE WEBHOOK (SOURCE OF TRUTH)
 // ============================================================
 app.post('/webhooks/stripe', async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -263,53 +103,62 @@ app.post('/webhooks/stripe', async (req, res) => {
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
-    console.error('❌ Webhook signature failed:', err.message);
+    console.error('❌ Webhook signature error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
-    // -------------------------------
-    // Invoice paid -> mark paid in Supabase
-    // -------------------------------
-    if (event.type === 'invoice.payment_succeeded') {
-      const invoice = event.data.object;
-
-      await supabase
-        .from('invoices')
-        .update({
-          status: 'paid',
-          paid_at: new Date(invoice.status_transitions.paid_at * 1000),
-        })
-        .eq('stripe_invoice_id', invoice.id);
-    }
-
-    // -------------------------------
-    // Payment succeeded -> award points
-    // ✅ Works for card + ACH (but ACH comes later)
-    // ✅ Also optionally marks Supabase invoice paid if metadata invoice_id exists
-    // -------------------------------
+    // ====================================================
+    // ✅ PAYMENT SUCCEEDED (CARD OR ACH CLEARED)
+    // ====================================================
     if (event.type === 'payment_intent.succeeded') {
       const intent = event.data.object;
-      const userId = intent.metadata?.user_id;
-      const invoiceId = intent.metadata?.invoice_id;
 
-      if (invoiceId) {
-        // Mark invoice paid (if you used PaymentIntent-per-invoice flow)
+      // Mark transaction succeeded
+      const { data: txn } = await supabase
+        .from('transactions')
+        .update({ status: 'succeeded' })
+        .eq('payment_intent_id', intent.id)
+        .select()
+        .single();
+
+      if (txn) {
+        // Apply points
         await supabase
-          .from('invoices')
+          .from('profiles')
           .update({
-            status: 'paid',
-            paid_at: new Date(),
+            points: supabase.rpc('increment', {
+              x: txn.points,
+            }),
           })
-          .eq('id', invoiceId);
-      }
+          .eq('id', txn.user_id);
 
-      if (userId) {
-        await supabase.rpc('award_points_for_payment', {
-          p_user_id: userId,
-          p_amount_cents: intent.amount_received,
-        });
+        // Mark invoice paid if linked
+        if (txn.invoice_id) {
+          await supabase
+            .from('invoices')
+            .update({
+              status: 'paid',
+              paid_at: new Date(),
+            })
+            .eq('id', txn.invoice_id);
+        }
       }
+    }
+
+    // ====================================================
+    // ❌ PAYMENT FAILED / CANCELED
+    // ====================================================
+    if (
+      event.type === 'payment_intent.payment_failed' ||
+      event.type === 'payment_intent.canceled'
+    ) {
+      const intent = event.data.object;
+
+      await supabase
+        .from('transactions')
+        .update({ status: 'failed' })
+        .eq('payment_intent_id', intent.id);
     }
 
     res.json({ received: true });
@@ -323,6 +172,7 @@ app.post('/webhooks/stripe', async (req, res) => {
 // ▶️ Start Server
 // ===============================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
+app.listen(PORT, () =>
+  console.log(`🚀 Stripe server running on port ${PORT}`)
+);
 
